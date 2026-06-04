@@ -17,6 +17,8 @@ const ALIAS_SUFFIX = ".xec";
 const ADDRESS_PAYLOAD_BYTES = 21;
 const ADDRESS_PAYLOAD_HEX_LENGTH = ADDRESS_PAYLOAD_BYTES * 2;
 const PAGE_SIZE = 200;
+const DEFAULT_ALIAS_LIMIT = 25;
+const MAX_ALIAS_LIMIT = 100;
 
 const port = Number(process.env.PORT || 3014);
 const chronikUrl = process.env.CHRONIK_URL || "https://chronik.xolosarmy.xyz";
@@ -29,6 +31,8 @@ export type AliasRecord = {
   blockheight?: number;
   source: "chronik-indexer";
 };
+
+type PublicAliasRecord = Omit<AliasRecord, "source">;
 
 let aliasIndex = new Map<string, AliasRecord>();
 let refreshedAt: string | null = null;
@@ -71,6 +75,34 @@ export function normalizeAlias(rawAlias: string): string {
 
 export function isValidAliasName(alias: string): boolean {
   return /^[a-z0-9]{1,21}$/.test(alias);
+}
+
+function parseAliasLimit(rawLimit: unknown): number {
+  if (typeof rawLimit !== "string") {
+    return DEFAULT_ALIAS_LIMIT;
+  }
+
+  const limit = Number.parseInt(rawLimit, 10);
+  if (!Number.isFinite(limit) || limit < 1) {
+    return DEFAULT_ALIAS_LIMIT;
+  }
+
+  return Math.min(limit, MAX_ALIAS_LIMIT);
+}
+
+function toPublicAliasRecord(record: AliasRecord): PublicAliasRecord {
+  return {
+    alias: record.alias,
+    address: record.address,
+    txid: record.txid,
+    blockheight: record.blockheight,
+  };
+}
+
+function getAlphabetizedAliases(): AliasRecord[] {
+  return Array.from(aliasIndex.values()).sort((left, right) =>
+    left.alias.localeCompare(right.alias),
+  );
 }
 
 export function parseAliasOpReturn(
@@ -276,6 +308,42 @@ app.get("/refresh", async (_req, res) => {
       lastRefreshError,
     });
   }
+});
+
+app.get("/aliases", (req, res) => {
+  const limit = parseAliasLimit(req.query.limit);
+  const aliases = getAlphabetizedAliases()
+    .slice(0, limit)
+    .map(toPublicAliasRecord);
+
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    total: aliasIndex.size,
+    limit,
+    refreshedAt,
+    aliases,
+  });
+});
+
+app.get("/aliases/search", (req, res) => {
+  if (typeof req.query.q !== "string" || req.query.q.trim() === "") {
+    res.status(400).json({ error: "Missing required query parameter: q" });
+    return;
+  }
+
+  const q = req.query.q.trim().toLowerCase();
+  const aliases = getAlphabetizedAliases()
+    .filter((record) => record.alias.includes(q))
+    .slice(0, MAX_ALIAS_LIMIT)
+    .map(toPublicAliasRecord);
+
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    total: aliasIndex.size,
+    limit: MAX_ALIAS_LIMIT,
+    refreshedAt,
+    aliases,
+  });
 });
 
 app.get("/alias/:alias", (req, res) => {
