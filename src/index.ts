@@ -29,12 +29,15 @@ export type AliasRecord = {
   address: string;
   txid: string;
   blockheight?: number;
-  source: "chronik-indexer";
+  status: "confirmed" | "pending";
+  source: "chronik-indexer" | "chronik-mempool";
 };
 
-type PublicAliasRecord = Omit<AliasRecord, "source">;
+type AliasStatus = AliasRecord["status"];
+type AliasSource = AliasRecord["source"];
 
 let aliasIndex = new Map<string, AliasRecord>();
+let pendingAliasMap = new Map<string, AliasRecord>();
 let refreshedAt: string | null = null;
 let lastRefreshError: string | null = null;
 
@@ -90,17 +93,16 @@ function parseAliasLimit(rawLimit: unknown): number {
   return Math.min(limit, MAX_ALIAS_LIMIT);
 }
 
-function toPublicAliasRecord(record: AliasRecord): PublicAliasRecord {
-  return {
-    alias: record.alias,
-    address: record.address,
-    txid: record.txid,
-    blockheight: record.blockheight,
-  };
+function parseIncludePending(rawIncludePending: unknown): boolean {
+  return rawIncludePending === "true";
 }
 
-function getAlphabetizedAliases(): AliasRecord[] {
-  return Array.from(aliasIndex.values()).sort((left, right) =>
+function getAlphabetizedAliases(includePending = false): AliasRecord[] {
+  const aliases = includePending
+    ? [...aliasIndex.values(), ...pendingAliasMap.values()]
+    : Array.from(aliasIndex.values());
+
+  return aliases.sort((left, right) =>
     left.alias.localeCompare(right.alias),
   );
 }
@@ -235,40 +237,75 @@ async function fetchConfirmedAliasTxs(): Promise<Tx[]> {
   return txs;
 }
 
+async function fetchPendingAliasTxs(): Promise<Tx[]> {
+  const unconfirmedTxs = await chronik.lokadId(LOKAD_ID).unconfirmedTxs();
+  return unconfirmedTxs.txs;
+}
+
+function addAliasTxsToIndex(
+  txs: Tx[],
+  targetIndex: Map<string, AliasRecord>,
+  status: AliasStatus,
+  source: AliasSource,
+  confirmedIndex = new Map<string, AliasRecord>(),
+): void {
+  for (const tx of txs) {
+    for (const output of tx.outputs) {
+      const outputScriptHex = extractOutputScriptHex(output);
+      if (!outputScriptHex) {
+        continue;
+      }
+
+      const parsedAlias = parseAliasOpReturn(outputScriptHex);
+      if (
+        !parsedAlias ||
+        targetIndex.has(parsedAlias.alias) ||
+        confirmedIndex.has(parsedAlias.alias)
+      ) {
+        // TODO: Implement full protocol conflict rules after MVP indexing.
+        continue;
+      }
+
+      const address = payloadToEcashAddress(parsedAlias.addressPayloadHex);
+      if (!address) {
+        continue;
+      }
+
+      targetIndex.set(parsedAlias.alias, {
+        alias: parsedAlias.alias,
+        address,
+        txid: tx.txid,
+        blockheight: tx.block?.height,
+        status,
+        source,
+      });
+    }
+  }
+}
+
 export async function refreshAliasIndex(): Promise<void> {
   try {
-    const txs = await fetchConfirmedAliasTxs();
+    const confirmedTxs = await fetchConfirmedAliasTxs();
     const nextAliasIndex = new Map<string, AliasRecord>();
+    addAliasTxsToIndex(
+      confirmedTxs,
+      nextAliasIndex,
+      "confirmed",
+      "chronik-indexer",
+    );
 
-    for (const tx of txs) {
-      for (const output of tx.outputs) {
-        const outputScriptHex = extractOutputScriptHex(output);
-        if (!outputScriptHex) {
-          continue;
-        }
-
-        const parsedAlias = parseAliasOpReturn(outputScriptHex);
-        if (!parsedAlias || nextAliasIndex.has(parsedAlias.alias)) {
-          // TODO: Implement full protocol conflict rules after MVP indexing.
-          continue;
-        }
-
-        const address = payloadToEcashAddress(parsedAlias.addressPayloadHex);
-        if (!address) {
-          continue;
-        }
-
-        nextAliasIndex.set(parsedAlias.alias, {
-          alias: parsedAlias.alias,
-          address,
-          txid: tx.txid,
-          blockheight: tx.block?.height,
-          source: "chronik-indexer",
-        });
-      }
-    }
+    const pendingTxs = await fetchPendingAliasTxs();
+    const nextPendingAliasMap = new Map<string, AliasRecord>();
+    addAliasTxsToIndex(
+      pendingTxs,
+      nextPendingAliasMap,
+      "pending",
+      "chronik-mempool",
+      nextAliasIndex,
+    );
 
     aliasIndex = nextAliasIndex;
+    pendingAliasMap = nextPendingAliasMap;
     refreshedAt = new Date().toISOString();
     lastRefreshError = null;
   } catch (error) {
@@ -285,7 +322,9 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: SERVICE_NAME,
-    aliases: aliasIndex.size,
+    confirmedAliases: aliasIndex.size,
+    pendingAliases: pendingAliasMap.size,
+    aliases: aliasIndex.size + pendingAliasMap.size,
     refreshedAt,
     lastRefreshError,
   });
@@ -297,7 +336,9 @@ app.get("/refresh", async (_req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.json({
       ok: true,
-      aliases: aliasIndex.size,
+      confirmedAliases: aliasIndex.size,
+      pendingAliases: pendingAliasMap.size,
+      aliases: aliasIndex.size + pendingAliasMap.size,
       refreshedAt,
       lastRefreshError,
     });
@@ -312,14 +353,17 @@ app.get("/refresh", async (_req, res) => {
 
 app.get("/aliases", (req, res) => {
   const limit = parseAliasLimit(req.query.limit);
-  const aliases = getAlphabetizedAliases()
-    .slice(0, limit)
-    .map(toPublicAliasRecord);
+  const includePending = parseIncludePending(req.query.includePending);
+  const allAliases = getAlphabetizedAliases(includePending);
+  const aliases = allAliases.slice(0, limit);
 
   res.setHeader("Cache-Control", "no-store");
   res.json({
-    total: aliasIndex.size,
+    total: allAliases.length,
+    confirmedAliases: aliasIndex.size,
+    pendingAliases: includePending ? pendingAliasMap.size : 0,
     limit,
+    includePending,
     refreshedAt,
     aliases,
   });
@@ -332,17 +376,21 @@ app.get("/aliases/search", (req, res) => {
   }
 
   const q = req.query.q.trim().toLowerCase();
-  const aliases = getAlphabetizedAliases()
+  const includePending = parseIncludePending(req.query.includePending);
+  const allAliases = getAlphabetizedAliases(includePending);
+  const matchedAliases = allAliases
     .filter((record) => record.alias.includes(q))
-    .slice(0, MAX_ALIAS_LIMIT)
-    .map(toPublicAliasRecord);
+    .slice(0, MAX_ALIAS_LIMIT);
 
   res.setHeader("Cache-Control", "no-store");
   res.json({
-    total: aliasIndex.size,
+    total: allAliases.length,
+    confirmedAliases: aliasIndex.size,
+    pendingAliases: includePending ? pendingAliasMap.size : 0,
     limit: MAX_ALIAS_LIMIT,
+    includePending,
     refreshedAt,
-    aliases,
+    aliases: matchedAliases,
   });
 });
 
@@ -354,7 +402,8 @@ app.get("/alias/:alias", (req, res) => {
     return;
   }
 
-  const record = aliasIndex.get(`${namePart}${ALIAS_SUFFIX}`);
+  const alias = `${namePart}${ALIAS_SUFFIX}`;
+  const record = aliasIndex.get(alias) ?? pendingAliasMap.get(alias);
   if (!record) {
     res.status(404).json({ error: "Alias not found" });
     return;
