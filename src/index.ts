@@ -41,11 +41,12 @@ let pendingAliasMap = new Map<string, AliasRecord>();
 let refreshedAt: string | null = null;
 let lastRefreshError: string | null = null;
 
-const allowedOrigins = new Set([
-  process.env.ALLOWED_ORIGIN || "https://ecash.mx",
-  "http://localhost:8080",
-  "http://127.0.0.1:8080",
-]);
+const allowedOrigins = new Set(
+  (process.env.ALLOWED_ORIGIN || "https://ecash.mx")
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter(Boolean),
+);
 
 const corsMiddleware = cors({
   origin(origin, callback) {
