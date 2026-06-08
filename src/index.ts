@@ -1,6 +1,8 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { ChronikClient, type Tx, type TxHistoryPage } from "chronik-client";
 import { encodeCashAddress } from "ecashaddrjs";
 
@@ -19,6 +21,11 @@ const ADDRESS_PAYLOAD_HEX_LENGTH = ADDRESS_PAYLOAD_BYTES * 2;
 const PAGE_SIZE = 200;
 const DEFAULT_ALIAS_LIMIT = 25;
 const MAX_ALIAS_LIMIT = 100;
+const DEFAULT_REFRESH_INTERVAL_MS = 300000;
+const SNAPSHOT_VERSION = 1;
+const DATA_DIR = path.join(process.cwd(), "data");
+const SNAPSHOT_FILE = path.join(DATA_DIR, "alias-index-snapshot.json");
+const SNAPSHOT_TMP_FILE = `${SNAPSHOT_FILE}.tmp`;
 
 const port = Number(process.env.PORT || 3014);
 const chronikUrl = process.env.CHRONIK_URL || "https://chronik.xolosarmy.xyz";
@@ -36,10 +43,48 @@ export type AliasRecord = {
 type AliasStatus = AliasRecord["status"];
 type AliasSource = AliasRecord["source"];
 
+type AliasSnapshot = {
+  version: 1;
+  refreshedAt: string;
+  confirmedAliases: number;
+  aliases: AliasRecord[];
+};
+
+type RefreshResult = {
+  ok: boolean;
+  confirmedAliases: number;
+  pendingAliases: number;
+  aliases: number;
+  refreshedAt: string | null;
+  lastRefreshError: string | null;
+  cachePreserved?: boolean;
+  snapshotWritten?: boolean;
+  isRefreshing: boolean;
+};
+
 let aliasIndex = new Map<string, AliasRecord>();
 let pendingAliasMap = new Map<string, AliasRecord>();
 let refreshedAt: string | null = null;
 let lastRefreshError: string | null = null;
+let snapshotLoaded = false;
+let snapshotRefreshedAt: string | null = null;
+let lastSnapshotError: string | null = null;
+let isRefreshing = false;
+
+function parseRefreshIntervalMs(rawValue: string | undefined): number {
+  if (!rawValue) {
+    return DEFAULT_REFRESH_INTERVAL_MS;
+  }
+
+  const parsedValue = Number.parseInt(rawValue, 10);
+  return Number.isFinite(parsedValue) && parsedValue > 0
+    ? parsedValue
+    : DEFAULT_REFRESH_INTERVAL_MS;
+}
+
+const refreshIntervalMs = parseRefreshIntervalMs(
+  process.env.ALIAS_REFRESH_INTERVAL_MS,
+);
 
 const allowedOrigins = new Set(
   (process.env.ALLOWED_ORIGIN || "https://ecash.mx")
@@ -70,6 +115,136 @@ function hexToBytes(hex: string): Uint8Array {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function getIndexStats() {
+  return {
+    confirmedAliases: aliasIndex.size,
+    pendingAliases: pendingAliasMap.size,
+    aliases: aliasIndex.size + pendingAliasMap.size,
+  };
+}
+
+function isIsoDate(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && new Date(timestamp).toISOString() === value;
+}
+
+function isConfirmedSnapshotRecord(value: unknown): value is AliasRecord {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const record = value as Partial<AliasRecord>;
+  return (
+    typeof record.alias === "string" &&
+    record.alias.endsWith(ALIAS_SUFFIX) &&
+    isValidAliasName(normalizeAlias(record.alias)) &&
+    typeof record.address === "string" &&
+    record.address.length > 0 &&
+    typeof record.txid === "string" &&
+    record.txid.length > 0 &&
+    (record.blockheight === undefined ||
+      typeof record.blockheight === "number") &&
+    record.status === "confirmed" &&
+    record.source === "chronik-indexer"
+  );
+}
+
+function parseAliasSnapshot(rawSnapshot: unknown): AliasSnapshot {
+  if (!rawSnapshot || typeof rawSnapshot !== "object") {
+    throw new Error("Snapshot is not an object");
+  }
+
+  const snapshot = rawSnapshot as Partial<AliasSnapshot>;
+  if (snapshot.version !== SNAPSHOT_VERSION) {
+    throw new Error("Unsupported snapshot version");
+  }
+
+  if (!isIsoDate(snapshot.refreshedAt)) {
+    throw new Error("Invalid snapshot refreshedAt");
+  }
+
+  const confirmedAliases = snapshot.confirmedAliases;
+  if (
+    typeof confirmedAliases !== "number" ||
+    !Number.isInteger(confirmedAliases) ||
+    confirmedAliases < 0
+  ) {
+    throw new Error("Invalid snapshot confirmedAliases");
+  }
+
+  if (!Array.isArray(snapshot.aliases)) {
+    throw new Error("Invalid snapshot aliases");
+  }
+
+  if (!snapshot.aliases.every(isConfirmedSnapshotRecord)) {
+    throw new Error("Snapshot contains invalid alias records");
+  }
+
+  if (confirmedAliases !== snapshot.aliases.length) {
+    throw new Error("Snapshot alias count mismatch");
+  }
+
+  return {
+    version: SNAPSHOT_VERSION,
+    refreshedAt: snapshot.refreshedAt,
+    confirmedAliases: snapshot.aliases.length,
+    aliases: snapshot.aliases,
+  };
+}
+
+async function loadAliasSnapshot(): Promise<void> {
+  try {
+    const snapshotJson = await readFile(SNAPSHOT_FILE, "utf8");
+    const snapshot = parseAliasSnapshot(JSON.parse(snapshotJson));
+    aliasIndex = new Map(snapshot.aliases.map((record) => [record.alias, record]));
+    pendingAliasMap = new Map();
+    refreshedAt = snapshot.refreshedAt;
+    snapshotLoaded = true;
+    snapshotRefreshedAt = snapshot.refreshedAt;
+    lastSnapshotError = null;
+    console.log(
+      `Loaded alias index snapshot with ${snapshot.confirmedAliases} aliases from ${SNAPSHOT_FILE}`,
+    );
+  } catch (error) {
+    const nodeError = error as NodeJS.ErrnoException;
+    snapshotLoaded = false;
+    snapshotRefreshedAt = null;
+
+    if (nodeError.code === "ENOENT") {
+      lastSnapshotError = null;
+      return;
+    }
+
+    lastSnapshotError = errorMessage(error);
+    console.warn("Alias index snapshot could not be loaded:", lastSnapshotError);
+  }
+}
+
+async function writeAliasSnapshot(
+  confirmedAliasMap: Map<string, AliasRecord>,
+  nextRefreshedAt: string,
+): Promise<void> {
+  const aliases = Array.from(confirmedAliasMap.values())
+    .filter((record) => record.status === "confirmed")
+    .sort((left, right) => left.alias.localeCompare(right.alias));
+  const snapshot: AliasSnapshot = {
+    version: SNAPSHOT_VERSION,
+    refreshedAt: nextRefreshedAt,
+    confirmedAliases: aliases.length,
+    aliases,
+  };
+
+  await mkdir(DATA_DIR, { recursive: true });
+  await writeFile(SNAPSHOT_TMP_FILE, `${JSON.stringify(snapshot, null, 2)}\n`, "utf8");
+  await rename(SNAPSHOT_TMP_FILE, SNAPSHOT_FILE);
+  snapshotRefreshedAt = nextRefreshedAt;
+  lastSnapshotError = null;
 }
 
 export function normalizeAlias(rawAlias: string): string {
@@ -284,7 +459,19 @@ function addAliasTxsToIndex(
   }
 }
 
-export async function refreshAliasIndex(): Promise<void> {
+export async function refreshAliasIndex(): Promise<RefreshResult> {
+  if (isRefreshing) {
+    return {
+      ok: false,
+      ...getIndexStats(),
+      refreshedAt,
+      lastRefreshError,
+      isRefreshing: true,
+    };
+  }
+
+  isRefreshing = true;
+
   try {
     const confirmedTxs = await fetchConfirmedAliasTxs();
     const nextAliasIndex = new Map<string, AliasRecord>();
@@ -305,14 +492,57 @@ export async function refreshAliasIndex(): Promise<void> {
       nextAliasIndex,
     );
 
+    const nextRefreshedAt = new Date().toISOString();
+    await writeAliasSnapshot(nextAliasIndex, nextRefreshedAt);
+
     aliasIndex = nextAliasIndex;
     pendingAliasMap = nextPendingAliasMap;
-    refreshedAt = new Date().toISOString();
+    refreshedAt = nextRefreshedAt;
     lastRefreshError = null;
+
+    return {
+      ok: true,
+      ...getIndexStats(),
+      refreshedAt,
+      lastRefreshError,
+      snapshotWritten: true,
+      isRefreshing: false,
+    };
   } catch (error) {
-    lastRefreshError = errorMessage(error);
-    throw error;
+    const message = errorMessage(error);
+    lastRefreshError = message;
+    if (message.includes("snapshot") || message.includes(SNAPSHOT_FILE)) {
+      lastSnapshotError = message;
+    }
+
+    return {
+      ok: false,
+      ...getIndexStats(),
+      refreshedAt,
+      lastRefreshError,
+      cachePreserved: true,
+      isRefreshing: false,
+    };
+  } finally {
+    isRefreshing = false;
   }
+}
+
+async function runBackgroundRefresh(reason: string): Promise<void> {
+  if (isRefreshing) {
+    console.log(`Skipping ${reason} alias refresh; refresh already in progress`);
+    return;
+  }
+
+  const result = await refreshAliasIndex();
+  if (result.ok) {
+    console.log(
+      `${reason} alias refresh succeeded with ${result.confirmedAliases} confirmed aliases`,
+    );
+    return;
+  }
+
+  console.error(`${reason} alias refresh failed: ${result.lastRefreshError}`);
 }
 
 app.use(corsMiddleware);
@@ -323,33 +553,34 @@ app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: SERVICE_NAME,
-    confirmedAliases: aliasIndex.size,
-    pendingAliases: pendingAliasMap.size,
-    aliases: aliasIndex.size + pendingAliasMap.size,
+    ...getIndexStats(),
     refreshedAt,
     lastRefreshError,
+    snapshotLoaded,
+    snapshotRefreshedAt,
+    lastSnapshotError,
+    isRefreshing,
+    refreshIntervalMs,
   });
 });
 
 app.get("/refresh", async (_req, res) => {
-  try {
-    await refreshAliasIndex();
-    res.setHeader("Cache-Control", "no-store");
-    res.json({
-      ok: true,
-      confirmedAliases: aliasIndex.size,
-      pendingAliases: pendingAliasMap.size,
-      aliases: aliasIndex.size + pendingAliasMap.size,
-      refreshedAt,
-      lastRefreshError,
-    });
-  } catch {
-    res.status(500).json({
+  res.setHeader("Cache-Control", "no-store");
+
+  if (isRefreshing) {
+    res.status(409).json({
       ok: false,
-      error: "Alias index refresh failed",
-      lastRefreshError,
+      error: "Refresh already in progress",
+      isRefreshing: true,
+      confirmedAliases: aliasIndex.size,
+      aliases: aliasIndex.size + pendingAliasMap.size,
+      skipped: true,
     });
+    return;
   }
+
+  const result = await refreshAliasIndex();
+  res.status(result.ok ? 200 : 503).json(result);
 });
 
 app.get("/aliases", (req, res) => {
@@ -414,10 +645,20 @@ app.get("/alias/:alias", (req, res) => {
   res.json(record);
 });
 
-app.listen(port, () => {
-  console.log(`${SERVICE_NAME} listening on port ${port}`);
+async function startServer(): Promise<void> {
+  await loadAliasSnapshot();
 
-  refreshAliasIndex().catch((error) => {
-    console.error("Initial alias index refresh failed:", errorMessage(error));
+  app.listen(port, () => {
+    console.log(`${SERVICE_NAME} listening on port ${port}`);
+    void runBackgroundRefresh("Startup");
+
+    setInterval(() => {
+      void runBackgroundRefresh("Scheduled");
+    }, refreshIntervalMs);
   });
+}
+
+startServer().catch((error) => {
+  console.error(`${SERVICE_NAME} failed to start:`, errorMessage(error));
+  process.exit(1);
 });
